@@ -56,6 +56,11 @@ class PidTuningWindow(QMainWindow):
         self.last_status: Optional[LiveStatus] = None
         self.capture_metadata: Optional[CaptureMetadata] = None
         self.capture_points: list[CapturePoint] = []
+        self.live_capture_armed = False
+        self.live_capture_running = False
+        self.live_capture_start_ms: Optional[int] = None
+        self.live_capture_trigger_baseline: Optional[int] = None
+        self.live_capture_duration_ms = 0
         self.tx_count = 0
         self.rx_count = 0
         self.status_count = 0
@@ -189,7 +194,7 @@ class PidTuningWindow(QMainWindow):
 
         self.apply_pid_button.clicked.connect(self.apply_pid)
         self.run_button.clicked.connect(lambda: self.send_command("run"))
-        self.stop_button.clicked.connect(lambda: self.send_command("stop"))
+        self.stop_button.clicked.connect(self.stop_controller)
         self.reset_button.clicked.connect(lambda: self.send_command("reset"))
 
         button_row = QWidget()
@@ -227,11 +232,13 @@ class PidTuningWindow(QMainWindow):
         self.capture_now_button = QPushButton("Capture Now")
         self.cancel_button = QPushButton("Cancel")
         self.save_button = QPushButton("Save Capture CSV")
+        self.arm_live_button = QPushButton("Arm Live Trigger")
 
         self.arm_button.clicked.connect(self.arm_capture)
         self.capture_now_button.clicked.connect(self.start_capture_now)
         self.cancel_button.clicked.connect(lambda: self.send_command("cancel"))
         self.save_button.clicked.connect(self.save_capture_csv)
+        self.arm_live_button.clicked.connect(self.arm_live_capture)
 
         button_row = QWidget()
         button_layout = QHBoxLayout(button_row)
@@ -243,6 +250,7 @@ class PidTuningWindow(QMainWindow):
         layout.addRow("Samples", self.capture_samples_spin)
         layout.addRow("Trigger Delta", self.capture_trigger_spin)
         layout.addRow("Interval ms", self.capture_interval_spin)
+        layout.addRow(self.arm_live_button)
         layout.addRow(self.arm_button)
         layout.addRow(button_row)
         layout.addRow(self.save_button)
@@ -256,6 +264,8 @@ class PidTuningWindow(QMainWindow):
         self.port_state_value = QLabel("closed")
         self.controller_value = QLabel("unknown")
         self.capture_value = QLabel("idle")
+        self.live_capture_value = QLabel("idle")
+        self.live_duration_value = QLabel("0.00 s")
         self.setpoint_value = QLabel("-")
         self.feedback_value = QLabel("-")
         self.error_value = QLabel("-")
@@ -273,6 +283,8 @@ class PidTuningWindow(QMainWindow):
             ("Port", self.port_state_value),
             ("Controller", self.controller_value),
             ("Capture", self.capture_value),
+            ("Live Capture", self.live_capture_value),
+            ("Live Duration", self.live_duration_value),
             ("Setpoint", self.setpoint_value),
             ("Feedback", self.feedback_value),
             ("Error", self.error_value),
@@ -494,6 +506,56 @@ class PidTuningWindow(QMainWindow):
         self.rx_count_value.setText(str(self.rx_count))
         self.status_count_value.setText(str(self.status_count))
         self.malformed_value.setText(str(self.malformed_count))
+        self.live_duration_value.setText(f"{self.live_capture_duration_ms / 1000.0:.2f} s")
+
+    def update_live_capture_state(self) -> None:
+        if self.live_capture_running:
+            self.live_capture_value.setText("recording")
+        elif self.live_capture_armed:
+            self.live_capture_value.setText("armed")
+        elif self.live_capture_duration_ms > 0:
+            self.live_capture_value.setText("stopped")
+        else:
+            self.live_capture_value.setText("idle")
+
+    def clear_live_buffers(self) -> None:
+        self.live_time.clear()
+        self.live_setpoint.clear()
+        self.live_feedback.clear()
+        self.live_output.clear()
+        self.live_pwm.clear()
+        self.update_live_plots()
+
+    def arm_live_capture(self) -> None:
+        self.live_capture_armed = True
+        self.live_capture_running = False
+        self.live_capture_start_ms = None
+        self.live_capture_duration_ms = 0
+        self.live_capture_trigger_baseline = self.last_status.setpoint if self.last_status is not None else None
+        self.clear_live_buffers()
+        self.update_live_capture_state()
+        self.update_comm_stats()
+        if self.live_capture_trigger_baseline is None:
+            self.append_log("Live capture armed. Waiting for first status row to establish trigger baseline.")
+        else:
+            self.append_log(
+                f"Live capture armed at setpoint {self.live_capture_trigger_baseline}. "
+                f"Waiting for trigger delta {self.capture_trigger_spin.value()}."
+            )
+
+    def stop_live_capture(self, reason: str) -> None:
+        if not self.live_capture_armed and not self.live_capture_running:
+            return
+        self.live_capture_armed = False
+        self.live_capture_running = False
+        self.live_capture_trigger_baseline = None
+        self.update_live_capture_state()
+        self.append_log(reason)
+
+    def stop_controller(self) -> None:
+        if self.live_capture_armed or self.live_capture_running:
+            self.stop_live_capture("Live capture stopped by user.")
+        self.send_command("stop")
 
     def send_command(self, command: str, *, quiet: bool = False) -> None:
         if not self.serial_port or not self.serial_port.is_open:
@@ -545,6 +607,47 @@ class PidTuningWindow(QMainWindow):
     def start_capture_now(self) -> None:
         command = f"capture {self.capture_samples_spin.value()} {self.capture_interval_spin.value()}"
         self.send_command(command)
+
+    def maybe_update_live_capture(self, status: LiveStatus) -> None:
+        if not self.live_capture_armed and not self.live_capture_running:
+            return
+
+        if self.live_capture_armed:
+            if self.live_capture_trigger_baseline is None:
+                self.live_capture_trigger_baseline = status.setpoint
+                self.append_log(
+                    f"Live capture baseline set to {self.live_capture_trigger_baseline}. "
+                    f"Waiting for trigger delta {self.capture_trigger_spin.value()}."
+                )
+                return
+
+            trigger_delta = self.capture_trigger_spin.value()
+            if abs(status.setpoint - self.live_capture_trigger_baseline) < trigger_delta:
+                return
+
+            self.live_capture_armed = False
+            self.live_capture_running = True
+            self.live_capture_start_ms = status.timestamp_ms
+            self.live_capture_duration_ms = 0
+            self.clear_live_buffers()
+            self.append_log(
+                f"Live capture triggered at setpoint {status.setpoint} "
+                f"(baseline {self.live_capture_trigger_baseline}, delta {trigger_delta})."
+            )
+            self.update_live_capture_state()
+
+        if not self.live_capture_running or self.live_capture_start_ms is None:
+            return
+
+        elapsed_seconds = (status.timestamp_ms - self.live_capture_start_ms) / 1000.0
+        self.live_capture_duration_ms = max(0, status.timestamp_ms - self.live_capture_start_ms)
+        self.live_time.append(elapsed_seconds)
+        self.live_setpoint.append(status.setpoint)
+        self.live_feedback.append(status.feedback)
+        self.live_output.append(status.raw_output)
+        self.live_pwm.append(status.pwm)
+        self.update_live_plots()
+        self.update_comm_stats()
 
     def poll_serial(self) -> None:
         if not self.serial_port or not self.serial_port.is_open:
@@ -636,13 +739,6 @@ class PidTuningWindow(QMainWindow):
         self.last_status = status
         self.status_count += 1
 
-        time_seconds = status.timestamp_ms / 1000.0
-        self.live_time.append(time_seconds)
-        self.live_setpoint.append(status.setpoint)
-        self.live_feedback.append(status.feedback)
-        self.live_output.append(status.raw_output)
-        self.live_pwm.append(status.pwm)
-
         self.controller_value.setText("enabled" if status.controller_enabled else "disabled")
         self.capture_value.setText(capture_state_name(status.capture_state))
         self.setpoint_value.setText(str(status.setpoint))
@@ -659,8 +755,9 @@ class PidTuningWindow(QMainWindow):
         self._sync_spin_if_idle(self.capture_interval_spin, status.capture_interval_ms)
 
         self.connection_value.setText("firmware responding")
+        self.maybe_update_live_capture(status)
+        self.update_live_capture_state()
         self.update_comm_stats()
-        self.update_live_plots()
 
     def _sync_spin_if_idle(self, widget, value) -> None:
         if widget.hasFocus():
