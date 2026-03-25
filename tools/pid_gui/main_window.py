@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
@@ -111,6 +112,11 @@ class PidTuningWindow(QMainWindow):
         control_layout.addWidget(self._build_status_group())
         control_layout.addWidget(self._build_console_group(), 1)
 
+        control_scroll = QScrollArea()
+        control_scroll.setWidgetResizable(True)
+        control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        control_scroll.setWidget(control_panel)
+
         plots_panel = QWidget()
         plots_layout = QVBoxLayout(plots_panel)
         plots_layout.setContentsMargins(0, 0, 0, 0)
@@ -139,7 +145,7 @@ class PidTuningWindow(QMainWindow):
         plots_layout.addWidget(self.live_drive_plot["widget"], 1)
         plots_layout.addWidget(self.capture_plot["widget"], 1)
 
-        splitter.addWidget(control_panel)
+        splitter.addWidget(control_scroll)
         splitter.addWidget(plots_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
